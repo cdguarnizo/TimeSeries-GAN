@@ -1,18 +1,3 @@
-# -*- coding: utf-8 -*-
-"""
-Created on Mon Dec  2 14:55:25 2019
-
-@author: ncelik34
-"""
-
-# -*- coding: utf-8 -*-
-"""
-Created on Wed Nov 27 11:07:16 2019
-
-@author: ncelik34
-"""
-
-# example of fitting an auxiliary classifier gan (ac-gan) on fashion mnsit
 from numpy import zeros
 from numpy import ones
 import numpy as np
@@ -20,6 +5,7 @@ import pandas as pd
 from numpy import expand_dims
 from numpy.random import randn
 from numpy.random import randint
+from sklearn.preprocessing import MinMaxScaler
 from keras.datasets.fashion_mnist import load_data
 from keras.optimizers import Adam
 from keras.models import Model
@@ -43,43 +29,42 @@ from keras.layers import Conv1D, GlobalAveragePooling1D, MaxPooling1D
 
 # define the standalone discriminator model
 def define_discriminator(in_shape=(384,1), n_classes=4):
-    # weight initialization
-    #init = RandomNormal(stddev=0.02)
-    # image input
+    init = RandomNormal(stddev=0.02)
     in_image = Input(shape=in_shape)
-    # downsample to 14x14
-    fe = Conv1D(16, 3, strides=2, padding='same')(in_image)
+    
+    fe = Conv1D(16, 3, strides=2, padding='same', kernel_initializer=init)(in_image)
     fe = LeakyReLU(alpha=0.2)(fe)
     fe = Dropout(0.2)(fe)
-    # normal
-    fe = Conv1D(32, 3, strides=2, padding='same')(fe)
-    fe = BatchNormalization()(fe)
-    fe = LeakyReLU(alpha=0.2)(fe)
-    fe = Dropout(0.2)(fe)
-    # downsample to 7x7
-    fe = Conv1D(64, 3, strides=2, padding='same')(fe)
+    
+    fe = Conv1D(32, 3, strides=2, padding='same', kernel_initializer=init)(fe)
     fe = BatchNormalization()(fe)
     fe = LeakyReLU(alpha=0.2)(fe)
     fe = Dropout(0.2)(fe)
     
-    #downsample one more
-    fe = Conv1D(128, 3, strides=2, padding='same')(fe)
+    fe = Conv1D(64, 3, strides=2, padding='same', kernel_initializer=init)(fe)
+    fe = BatchNormalization()(fe)
+    fe = LeakyReLU(alpha=0.2)(fe)
+    fe = Dropout(0.2)(fe)
+    
+    fe = Conv1D(128, 3, strides=2, padding='same', kernel_initializer=init)(fe)
     fe = BatchNormalization()(fe)
     fe = LeakyReLU(alpha=0.2)(fe)
     fe = Dropout(0.2)(fe)
    
-    # flatten feature maps
     fe = Flatten()(fe)
-    # real/fake output
-    out1 = Dense(1, activation='sigmoid')(fe)
-    # class label output
-    out2 = Dense(n_classes, activation='softmax')(fe)
-    # define model
-    model = Model(in_image, [out1, out2])
-    # compile model
-    opt = Adam(lr=0.0002, beta_1=0.5)
-    model.compile(loss=['binary_crossentropy', 'sparse_categorical_crossentropy'], optimizer=opt)
-    model.summary()
+    
+    # Use consistent output names
+    out_validity = Dense(1, activation='sigmoid', name='validity')(fe)
+    out_label = Dense(n_classes, activation='softmax', name='label')(fe)
+    
+    model = Model(in_image, [out_validity, out_label])
+    
+    opt = Adam(learning_rate=0.0002, beta_1=0.5)
+    model.compile(
+        loss={'validity': 'binary_crossentropy', 'label': 'sparse_categorical_crossentropy'},
+        optimizer=opt,
+        loss_weights={'validity': 1.0, 'label': 1.0}
+    )
     return model
 
 # define the standalone generator model
@@ -137,15 +122,17 @@ def define_generator(latent_dim, n_classes=4):
  
 # define the combined generator and discriminator model, for updating the generator
 def define_gan(g_model, d_model):
-    # make weights in the discriminator not trainable
     d_model.trainable = False
-    # connect the outputs of the generator to the inputs of the discriminator
+    
     gan_output = d_model(g_model.output)
-    # define gan model as taking noise and label and outputting real/fake and label outputs
+    
     model = Model(g_model.input, gan_output)
-    # compile model
-    opt = Adam(lr=0.0002, beta_1=0.5)
-    model.compile(loss=['binary_crossentropy', 'sparse_categorical_crossentropy'], optimizer=opt)
+    
+    opt = Adam(learning_rate=0.0002, beta_1=0.5)
+    model.compile(
+        loss=['binary_crossentropy','sparse_categorical_crossentropy'],
+        optimizer=opt,
+    )
     return model
  
 # load images
@@ -200,15 +187,11 @@ def load_real_samples():
  
 # select real samples
 def generate_real_samples(dataset, n_samples):
-    # split into images and labels
     images, labels = dataset
-    # choose random instances
     ix = randint(0, images.shape[0], n_samples)
-    # select images and labels
     X, labels = images[ix], labels[ix]
-    # generate class labels
     y = ones((n_samples, 1))
-    return [X, labels], y
+    return [X, labels], {'validity': y, 'label': labels}
 
 # generate points in latent space as input for the generator
 def generate_latent_points(latent_dim, n_samples, n_classes=4):
@@ -222,13 +205,10 @@ def generate_latent_points(latent_dim, n_samples, n_classes=4):
 
 # use the generator to generate n fake examples, with class labels
 def generate_fake_samples(generator, latent_dim, n_samples):
-    # generate points in latent space
     z_input, labels_input = generate_latent_points(latent_dim, n_samples)
-    # predict outputs
     images = generator.predict([z_input, labels_input])
-    # create class labels
     y = zeros((n_samples, 1))
-    return [images, labels_input], y
+    return [images, labels_input], {'validity': y, 'label': labels_input}
  
 # generate samples and save as a plot and save the model
 def summarize_performance(step, g_model, latent_dim, n_samples=100):
@@ -259,33 +239,30 @@ def summarize_performance(step, g_model, latent_dim, n_samples=100):
  
 # train the generator and discriminator
 def train(g_model, d_model, gan_model, dataset, latent_dim, n_epochs=30, n_batch=64):
-    # calculate the number of batches per training epoch
     bat_per_epo = int(dataset[0].shape[0] / n_batch)
-    print('batch per epoch: %d' % bat_per_epo)
-    # calculate the number of training iterations
     n_steps = bat_per_epo * n_epochs
-    print('number of steps: %d' % n_steps)
-    # calculate the size of half a batch of samples
     half_batch = int(n_batch / 2)
-    # manually enumerate epochs
+    
     for i in range(n_steps):
-        # get randomly selected 'real' samples
+        # Train discriminator on real samples
         [X_real, labels_real], y_real = generate_real_samples(dataset, half_batch)
-        # update discriminator model weights
-        _,d_r1,d_r2 = d_model.train_on_batch(X_real, [y_real, labels_real])
-        # generate 'fake' examples
+        d_loss_real = d_model.train_on_batch(X_real, [y_real, labels_real])
+
+        # Train discriminator on fake samples
         [X_fake, labels_fake], y_fake = generate_fake_samples(g_model, latent_dim, half_batch)
-        # update discriminator model weights
-        _,d_f,d_f2 = d_model.train_on_batch(X_fake, [y_fake, labels_fake])
-        # prepare points in latent space as input for the generator
+        d_loss_fake = d_model.train_on_batch(X_fake, [y_fake, labels_fake])
+        
+        # Train generator
         [z_input, z_labels] = generate_latent_points(latent_dim, n_batch)
-        # create inverted labels for the fake samples
+        #y_gan = {'validity': ones((n_batch, 1)), 'label': z_labels}
+        #g_loss = gan_model.train_on_batch([z_input, z_labels], y_gan)
         y_gan = ones((n_batch, 1))
-        # update the generator via the discriminator's error
-        _,g_1,g_2 = gan_model.train_on_batch([z_input, z_labels], [y_gan, z_labels])
-        # summarize loss on this batch
-        print('>%d, dr[%.3f,%.3f], df[%.3f,%.3f], g[%.3f,%.3f]' % (i+1, d_r1,d_r2, d_f,d_f2, g_1,g_2))
-        # evaluate the model performance every 'epoch'
+        g_loss = gan_model.train_on_batch([z_input, z_labels], [y_gan, z_labels])
+        
+        # Summarize loss
+        print(f'>Iteration {i+1}/{n_steps}, \n D_real: {d_loss_real:.3f}, \n D_fake: {d_loss_fake:.3f}, \n G: {g_loss[0]:.3f}')
+        
+        # Performance evaluation
         if (i+1) % (bat_per_epo * 1) == 0:
             summarize_performance(i, g_model, latent_dim)
  
@@ -299,6 +276,8 @@ generator = define_generator(latent_dim)
 gan_model = define_gan(generator, discriminator)
 # load image data
 dataset = load_real_samples()
+discriminator.trainable = True
+generator.trainable = True
 # train model
 train(generator, discriminator, gan_model, dataset, latent_dim)
 
